@@ -1,0 +1,970 @@
+From 23081486ffec0973b01e66e2cbad93a1a7dec267 Mon Sep 17 00:00:00 2001
+From: Peter Edberg <pedberg@unicode.org>
+Date: Mon, 10 Jan 2022 20:04:58 -0800
+Subject: [PATCH] ICU-21353 Implement DateTimePatternGenerator use of correct
+ datetime pattern; includes new getter/setter API per TC discussion.
+
+---
+ icu4c/source/i18n/dtptngen.cpp                |  79 ++++++--
+ icu4c/source/i18n/udatpg.cpp                  |  41 +++-
+ icu4c/source/i18n/unicode/dtptngen.h          |  62 +++++-
+ icu4c/source/i18n/unicode/udatpg.h            |  75 ++++++++
+ .../test/cintltst/cdateintervalformattest.c   |  80 ++++----
+ icu4c/source/test/cintltst/udatpg_test.c      | 176 ++++++++++++++++++
+ icu4c/source/test/intltest/dtfmttst.cpp       |   2 +-
+ icu4c/source/test/intltest/dtptngts.cpp       | 149 ++++++++++++++-
+ icu4c/source/test/intltest/dtptngts.h         |  10 +
+ icu4c/source/test/intltest/tmsgfmt.cpp        |   4 +-
+ 10 files changed, 618 insertions(+), 60 deletions(-)
+
+diff --git a/icu4c/source/i18n/dtptngen.cpp b/icu4c/source/i18n/dtptngen.cpp
+index 987d83663a..10d4a3c887 100644
+--- a/icu4c/source/i18n/dtptngen.cpp
++++ b/icu4c/source/i18n/dtptngen.cpp
+@@ -393,10 +393,13 @@ DateTimePatternGenerator::operator=(const DateTimePatternGenerator& other) {
+     *fp = *(other.fp);
+     dtMatcher->copyFrom(other.dtMatcher->skeleton);
+     *distanceInfo = *(other.distanceInfo);
+-    dateTimeFormat = other.dateTimeFormat;
++    for (int32_t style = UDAT_FULL; style <= UDAT_SHORT; style++) {
++        dateTimeFormat[style] = other.dateTimeFormat[style];
++    }
+     decimal = other.decimal;
+-    // NUL-terminate for the C API.
+-    dateTimeFormat.getTerminatedBuffer();
++    for (int32_t style = UDAT_FULL; style <= UDAT_SHORT; style++) {
++        dateTimeFormat[style].getTerminatedBuffer(); // NUL-terminate for the C API.
++    }
+     decimal.getTerminatedBuffer();
+     delete skipMatcher;
+     if ( other.skipMatcher == nullptr ) {
+@@ -430,7 +433,12 @@ DateTimePatternGenerator::operator==(const DateTimePatternGenerator& other) cons
+         return true;
+     }
+     if ((pLocale==other.pLocale) && (patternMap->equals(*other.patternMap)) &&
+-        (dateTimeFormat==other.dateTimeFormat) && (decimal==other.decimal)) {
++        (decimal==other.decimal)) {
++        for (int32_t style = UDAT_FULL; style <= UDAT_SHORT; style++) {
++            if (dateTimeFormat[style] != other.dateTimeFormat[style]) {
++                return false;
++            }
++        }
+         for ( int32_t i=0 ; i<UDATPG_FIELD_COUNT; ++i ) {
+             if (appendItemFormats[i] != other.appendItemFormats[i]) {
+                 return false;
+@@ -1199,7 +1207,21 @@ DateTimePatternGenerator::getBestPattern(const UnicodeString& patternForm, UDate
+     }
+     resultPattern.remove();
+     status = U_ZERO_ERROR;
+-    dtFormat=getDateTimeFormat();
++    // determine which dateTimeFormat to use
++    PtnSkeleton* reqSkeleton = dtMatcher->getSkeletonPtr();
++    UDateFormatStyle style = UDAT_SHORT;
++    int32_t monthFieldLen = reqSkeleton->baseOriginal.getFieldLength(UDATPG_MONTH_FIELD);
++    if (monthFieldLen == 4) {
++        if (reqSkeleton->baseOriginal.getFieldLength(UDATPG_WEEKDAY_FIELD) > 0) {
++            style = UDAT_FULL;
++        } else {
++            style = UDAT_LONG;
++        }
++    } else if (monthFieldLen == 3) {
++        style = UDAT_MEDIUM;
++    }
++    // and now use it to compose date and time
++    dtFormat=getDateTimeFormat(style, status);
+     SimpleFormatter(dtFormat, 2, 2, status).format(timePattern, datePattern, resultPattern, status);
+     return resultPattern;
+ }
+@@ -1335,14 +1357,45 @@ DateTimePatternGenerator::addCanonicalItems(UErrorCode& status) {
+ 
+ void
+ DateTimePatternGenerator::setDateTimeFormat(const UnicodeString& dtFormat) {
+-    dateTimeFormat = dtFormat;
+-    // NUL-terminate for the C API.
+-    dateTimeFormat.getTerminatedBuffer();
++    UErrorCode status = U_ZERO_ERROR;
++    for (int32_t style = UDAT_FULL; style <= UDAT_SHORT; style++) {
++        setDateTimeFormat((UDateFormatStyle)style, dtFormat, status);
++    }
+ }
+ 
+ const UnicodeString&
+ DateTimePatternGenerator::getDateTimeFormat() const {
+-    return dateTimeFormat;
++    UErrorCode status = U_ZERO_ERROR;
++    return getDateTimeFormat(UDAT_MEDIUM, status);
++}
++
++void
++DateTimePatternGenerator::setDateTimeFormat(UDateFormatStyle style, const UnicodeString& dtFormat, UErrorCode& status) {
++    if (U_FAILURE(status)) {
++        return;
++    }
++    if (style < UDAT_FULL || style > UDAT_SHORT) {
++        status = U_ILLEGAL_ARGUMENT_ERROR;
++        return;
++    }
++    dateTimeFormat[style] = dtFormat;
++    // Note for the following: getTerminatedBuffer() can re-allocate the UnicodeString
++    // buffer so we do this here before clients request a const ref to the UnicodeString
++    // or its buffer.
++    dateTimeFormat[style].getTerminatedBuffer(); // NUL-terminate for the C API.
++}
++
++const UnicodeString&
++DateTimePatternGenerator::getDateTimeFormat(UDateFormatStyle style, UErrorCode& status) const {
++    static const UnicodeString emptyString = UNICODE_STRING_SIMPLE("");
++    if (U_FAILURE(status)) {
++        return emptyString;
++    }
++    if (style < UDAT_FULL || style > UDAT_SHORT) {
++        status = U_ILLEGAL_ARGUMENT_ERROR;
++        return emptyString;
++    }
++    return dateTimeFormat[style];
+ }
+ 
+ void
+@@ -1378,13 +1431,15 @@ DateTimePatternGenerator::setDateTimeFromCalendar(const Locale& locale, UErrorCo
+     }
+     if (U_FAILURE(status)) { return; }
+ 
+-    if (ures_getSize(dateTimePatterns.getAlias()) <= DateFormat::kDateTime)
++    if (ures_getSize(dateTimePatterns.getAlias()) <= DateFormat::kDateTimeOffset + DateFormat::kShort)
+     {
+         status = U_INVALID_FORMAT_ERROR;
+         return;
+     }
+-    resStr = ures_getStringByIndex(dateTimePatterns.getAlias(), (int32_t)DateFormat::kDateTime, &resStrLen, &status);
+-    setDateTimeFormat(UnicodeString(TRUE, resStr, resStrLen));
++    for (int32_t style = UDAT_FULL; style <= UDAT_SHORT; style++) {
++        resStr = ures_getStringByIndex(dateTimePatterns.getAlias(), (int32_t)DateFormat::kDateTimeOffset + style, &resStrLen, &status);
++        setDateTimeFormat((UDateFormatStyle)style, UnicodeString(TRUE, resStr, resStrLen), status);
++    }
+ }
+ 
+ void
+diff --git a/icu4c/source/i18n/udatpg.cpp b/icu4c/source/i18n/udatpg.cpp
+index 332636a938..9e61a12076 100644
+--- a/icu4c/source/i18n/udatpg.cpp
++++ b/icu4c/source/i18n/udatpg.cpp
+@@ -210,12 +210,47 @@ udatpg_setDateTimeFormat(const UDateTimePatternGenerator *dtpg,
+ U_CAPI const UChar * U_EXPORT2
+ udatpg_getDateTimeFormat(const UDateTimePatternGenerator *dtpg,
+                          int32_t *pLength) {
+-    const UnicodeString &result=((const DateTimePatternGenerator *)dtpg)->getDateTimeFormat();
+-    if(pLength!=NULL) {
++    UErrorCode status = U_ZERO_ERROR;
++    return udatpg_getDateTimeFormatForStyle(dtpg, UDAT_MEDIUM, pLength, &status);
++}
++
++U_CAPI void U_EXPORT2
++udatpg_setDateTimeFormatForStyle(UDateTimePatternGenerator *udtpg,
++                        UDateFormatStyle style,
++                        const UChar *dateTimeFormat, int32_t length,
++                        UErrorCode *pErrorCode) {
++    if (U_FAILURE(*pErrorCode)) {
++        return;
++    } else if (dateTimeFormat==nullptr) {
++        *pErrorCode = U_ILLEGAL_ARGUMENT_ERROR;
++        return;
++    }
++    DateTimePatternGenerator *dtpg = reinterpret_cast<DateTimePatternGenerator *>(udtpg);
++    UnicodeString dtFormatString((UBool)(length<0), dateTimeFormat, length);
++    dtpg->setDateTimeFormat(style, dtFormatString, *pErrorCode);
++}
++
++U_CAPI const UChar* U_EXPORT2
++udatpg_getDateTimeFormatForStyle(const UDateTimePatternGenerator *udtpg,
++                        UDateFormatStyle style, int32_t *pLength,
++                        UErrorCode *pErrorCode) {
++    static const UChar emptyString[] = { (UChar)0 };
++    if (U_FAILURE(*pErrorCode)) {
++        if (pLength !=nullptr) {
++            *pLength = 0;
++        }
++        return emptyString;
++    }
++    const DateTimePatternGenerator *dtpg = reinterpret_cast<const DateTimePatternGenerator *>(udtpg);
++    const UnicodeString &result = dtpg->getDateTimeFormat(style, *pErrorCode);
++    if (pLength != nullptr) {
+         *pLength=result.length();
+     }
++    // Note: The UnicodeString for the dateTimeFormat string in the DateTimePatternGenerator
++    // was NUL-terminated what it was set, to avoid doing it here which could re-allocate
++    // the buffe and affect and cont references to the string or its buffer.
+     return result.getBuffer();
+-}
++ }
+ 
+ U_CAPI void U_EXPORT2
+ udatpg_setDecimal(UDateTimePatternGenerator *dtpg,
+diff --git a/icu4c/source/i18n/unicode/dtptngen.h b/icu4c/source/i18n/unicode/dtptngen.h
+index 250a0e089f..0b6390537b 100644
+--- a/icu4c/source/i18n/unicode/dtptngen.h
++++ b/icu4c/source/i18n/unicode/dtptngen.h
+@@ -311,6 +311,11 @@ class U_I18N_API DateTimePatternGenerator : public UObject {
+      * for those two skeletons, so the result is put together with this pattern,
+      * resulting in "d-MMM h:mm".
+      *
++     * There are four DateTimeFormats in a DateTimePatternGenerator object,
++     * corresponding to date styles UDAT_FULL..UDAT_SHORT. This method sets
++     * all of them to the specified pattern. To set them individually, see
++     * setDateTimeFormat(UDateFormatStyle style, ...).
++     *
+      * @param dateTimeFormat
+      *            message format pattern, here {1} will be replaced by the date
+      *            pattern and {0} will be replaced by the time pattern.
+@@ -320,11 +325,66 @@ class U_I18N_API DateTimePatternGenerator : public UObject {
+ 
+     /**
+      * Getter corresponding to setDateTimeFormat.
++     *
++     * There are four DateTimeFormats in a DateTimePatternGenerator object,
++     * corresponding to date styles UDAT_FULL..UDAT_SHORT. This method gets
++     * the style for UDAT_MEDIUM (the default). To get them individually, see
++     * getDateTimeFormat(UDateFormatStyle style).
++     *
+      * @return DateTimeFormat.
+      * @stable ICU 3.8
+      */
+     const UnicodeString& getDateTimeFormat() const;
+ 
++#if !UCONFIG_NO_FORMATTING
++#ifndef U_HIDE_DRAFT_API
++    /**
++     * dateTimeFormats are message patterns used to compose combinations of date
++     * and time patterns. There are four length styles, corresponding to the
++     * inferred style of the date pattern; these are UDateFormatStyle values:
++     *  - UDAT_FULL (for date pattern with weekday and long month), else
++     *  - UDAT_LONG (for a date pattern with long month), else
++     *  - UDAT_MEDIUM (for a date pattern with abbreviated month), else
++     *  - UDAT_SHORT (for any other date pattern).
++     * For details on dateTimeFormats, see
++     * https://www.unicode.org/reports/tr35/tr35-dates.html#dateTimeFormats.
++     * The default pattern in the root locale for all styles is "{1} {0}".
++     *
++     * @param style
++     *              one of DateFormat.FULL..DateFormat.SHORT. Error if out of range.
++     * @param dateTimeFormat
++     *              the new dateTimeFormat to set for the the specified style
++     * @param status
++     *              in/out parameter; if no failure status is already set,
++     *              it will be set according to result of the function (e.g.
++     *              U_ILLEGAL_ARGUMENT_ERROR for style out of range).
++     * @draft ICU 71
++     */
++    void setDateTimeFormat(UDateFormatStyle style, const UnicodeString& dateTimeFormat,
++                            UErrorCode& status);
++
++    /**
++     * Getter corresponding to setDateTimeFormat.
++     *
++     * @param style
++     *              one of UDAT_FULL..UDAT_SHORT. Error if out of range.
++     * @param status
++     *              in/out parameter; if no failure status is already set,
++     *              it will be set according to result of the function (e.g.
++     *              U_ILLEGAL_ARGUMENT_ERROR for style out of range).
++     * @return
++     *              the current dateTimeFormat for the the specified style, or
++     *              empty string in case of error. The UnicodeString reference,
++     *              or the contents of the string, may no longer be valid if
++     *              setDateTimeFormat is called, or the DateTimePatternGenerator
++     *              object is deleted.
++     * @draft ICU 71
++     */
++    const UnicodeString& getDateTimeFormat(UDateFormatStyle style,
++                            UErrorCode& status) const;
++#endif /* U_HIDE_DRAFT_API */
++#endif /* #if !UCONFIG_NO_FORMATTING */
++
+     /**
+      * Return the best pattern matching the input skeleton. It is guaranteed to
+      * have all of the fields in the skeleton.
+@@ -556,7 +616,7 @@ class U_I18N_API DateTimePatternGenerator : public UObject {
+     UnicodeString appendItemFormats[UDATPG_FIELD_COUNT];
+     // TODO(ticket:13619): [3] -> UDATPG_WIDTH_COUNT
+     UnicodeString fieldDisplayNames[UDATPG_FIELD_COUNT][3];
+-    UnicodeString dateTimeFormat;
++    UnicodeString dateTimeFormat[4];
+     UnicodeString decimal;
+     DateTimeMatcher *skipMatcher;
+     Hashtable *fAvailableFormatKeyHash;
+diff --git a/icu4c/source/i18n/unicode/udatpg.h b/icu4c/source/i18n/unicode/udatpg.h
+index efe4357bfe..684a905e42 100644
+--- a/icu4c/source/i18n/unicode/udatpg.h
++++ b/icu4c/source/i18n/unicode/udatpg.h
+@@ -492,6 +492,11 @@ udatpg_getFieldDisplayName(const UDateTimePatternGenerator *dtpg,
+  * for those two skeletons, so the result is put together with this pattern,
+  * resulting in "d-MMM h:mm".
+  *
++ * There are four DateTimeFormats in a UDateTimePatternGenerator object,
++ * corresponding to date styles UDAT_FULL..UDAT_SHORT. This method sets
++ * all of them to the specified pattern. To set them individually, see
++ * udatpg_setDateTimeFormatForStyle.
++ *
+  * @param dtpg a pointer to UDateTimePatternGenerator.
+  * @param dtFormat
+  *            message format pattern, here {1} will be replaced by the date
+@@ -505,6 +510,12 @@ udatpg_setDateTimeFormat(const UDateTimePatternGenerator *dtpg,
+ 
+ /**
+  * Getter corresponding to setDateTimeFormat.
++ *
++ * There are four DateTimeFormats in a UDateTimePatternGenerator object,
++ * corresponding to date styles UDAT_FULL..UDAT_SHORT. This method gets
++ * the style for UDAT_MEDIUM (the default). To get them individually, see
++ * udatpg_getDateTimeFormatForStyle.
++ *
+  * @param dtpg   a pointer to UDateTimePatternGenerator.
+  * @param pLength A pointer that will receive the length of the format
+  * @return dateTimeFormat.
+@@ -514,6 +525,70 @@ U_CAPI const UChar * U_EXPORT2
+ udatpg_getDateTimeFormat(const UDateTimePatternGenerator *dtpg,
+                          int32_t *pLength);
+ 
++#if !UCONFIG_NO_FORMATTING
++#ifndef U_HIDE_DRAFT_API
++/**
++ * dateTimeFormats are message patterns used to compose combinations of date
++ * and time patterns. There are four length styles, corresponding to the
++ * inferred style of the date pattern; these are UDateFormatStyle values:
++ *  - UDAT_FULL (for date pattern with weekday and long month), else
++ *  - UDAT_LONG (for a date pattern with long month), else
++ *  - UDAT_MEDIUM (for a date pattern with abbreviated month), else
++ *  - UDAT_SHORT (for any other date pattern).
++ * For details on dateTimeFormats, see
++ * https://www.unicode.org/reports/tr35/tr35-dates.html#dateTimeFormats.
++ * The default pattern in the root locale for all styles is "{1} {0}".
++ *
++ * @param udtpg
++ *              a pointer to the UDateTimePatternGenerator
++ * @param style
++ *              one of UDAT_FULL..UDAT_SHORT. Error if out of range.
++ * @param dateTimeFormat
++ *              the new dateTimeFormat to set for the the specified style
++ * @param length
++ *              the length of dateTimeFormat, or -1 if unknown and pattern
++ *              is null-terminated
++ * @param pErrorCode
++ *              a pointer to the UErrorCode (in/out parameter); if no failure
++ *              status is already set, it will be set according to result of the
++ *              function (e.g. U_ILLEGAL_ARGUMENT_ERROR for style out of range).
++ * @draft ICU 71
++ */
++U_CAPI void U_EXPORT2
++udatpg_setDateTimeFormatForStyle(UDateTimePatternGenerator *udtpg,
++                        UDateFormatStyle style,
++                        const UChar *dateTimeFormat, int32_t length,
++                        UErrorCode *pErrorCode);
++
++/**
++ * Getter corresponding to udatpg_setDateTimeFormatForStyle.
++ *
++ * @param udtpg
++ *              a pointer to the UDateTimePatternGenerator
++ * @param style
++ *              one of UDAT_FULL..UDAT_SHORT. Error if out of range.
++ * @param pLength
++ *              a pointer that will receive the length of the format. May be NULL
++ *              if length is not desired.
++ * @param pErrorCode
++ *              a pointer to the UErrorCode (in/out parameter); if no failure
++ *              status is already set, it will be set according to result of the
++ *              function (e.g. U_ILLEGAL_ARGUMENT_ERROR for style out of range).
++ * @return
++ *              pointer to the current dateTimeFormat (0 terminated) for the specified
++ *              style, or empty string in case of error. The pointer and its contents
++ *              may no longer be valid if udatpg_setDateTimeFormat is called, or
++ *              udatpg_setDateTimeFormatForStyle for the same style is called, or the
++ *              UDateTimePatternGenerator object is closed.
++ * @draft ICU 71
++ */
++U_CAPI const UChar* U_EXPORT2
++udatpg_getDateTimeFormatForStyle(const UDateTimePatternGenerator *udtpg,
++                        UDateFormatStyle style, int32_t *pLength,
++                        UErrorCode *pErrorCode);
++#endif /* U_HIDE_DRAFT_API */
++#endif /* #if !UCONFIG_NO_FORMATTING */
++
+ /**
+  * The decimal value is used in formatting fractions of seconds. If the
+  * skeleton contains fractional seconds, then this is used with the
+diff --git a/icu4c/source/test/cintltst/cdateintervalformattest.c b/icu4c/source/test/cintltst/cdateintervalformattest.c
+index 513989ac6b..8f157d2f5d 100644
+--- a/icu4c/source/test/cintltst/cdateintervalformattest.c
++++ b/icu4c/source/test/cintltst/cdateintervalformattest.c
+@@ -368,23 +368,23 @@ static void TestFormatToResult() {
+ 
+     {
+         const char* message = "Field position test 1";
+-        const UChar* expectedString = u"27. September 2010, 15:00 – 2. März 2011, 18:30";
++        const UChar* expectedString = u"27. September 2010 um 15:00 – 2. März 2011 um 18:30";
+         udtitvfmt_formatToResult(fmt, Date201009270800, Date201103021030, fdi, &ec);
+         assertSuccess("Formatting", &ec);
+         static const UFieldPositionWithCategory expectedFieldPositions[] = {
+             // category, field, begin index, end index
+-            {UFIELD_CATEGORY_DATE_INTERVAL_SPAN, 0, 0, 25},
++            {UFIELD_CATEGORY_DATE_INTERVAL_SPAN, 0, 0, 27},
+             {UFIELD_CATEGORY_DATE, UDAT_DATE_FIELD, 0, 2},
+             {UFIELD_CATEGORY_DATE, UDAT_MONTH_FIELD, 4, 13},
+             {UFIELD_CATEGORY_DATE, UDAT_YEAR_FIELD, 14, 18},
+-            {UFIELD_CATEGORY_DATE, UDAT_HOUR_OF_DAY0_FIELD, 20, 22},
+-            {UFIELD_CATEGORY_DATE, UDAT_MINUTE_FIELD, 23, 25},
+-            {UFIELD_CATEGORY_DATE_INTERVAL_SPAN, 1, 28, 47},
+-            {UFIELD_CATEGORY_DATE, UDAT_DATE_FIELD, 28, 29},
+-            {UFIELD_CATEGORY_DATE, UDAT_MONTH_FIELD, 31, 35},
+-            {UFIELD_CATEGORY_DATE, UDAT_YEAR_FIELD, 36, 40},
+-            {UFIELD_CATEGORY_DATE, UDAT_HOUR_OF_DAY0_FIELD, 42, 44},
+-            {UFIELD_CATEGORY_DATE, UDAT_MINUTE_FIELD, 45, 47}};
++            {UFIELD_CATEGORY_DATE, UDAT_HOUR_OF_DAY0_FIELD, 22, 24},
++            {UFIELD_CATEGORY_DATE, UDAT_MINUTE_FIELD, 25, 27},
++            {UFIELD_CATEGORY_DATE_INTERVAL_SPAN, 1, 30, 51},
++            {UFIELD_CATEGORY_DATE, UDAT_DATE_FIELD, 30, 31},
++            {UFIELD_CATEGORY_DATE, UDAT_MONTH_FIELD, 33, 37},
++            {UFIELD_CATEGORY_DATE, UDAT_YEAR_FIELD, 38, 42},
++            {UFIELD_CATEGORY_DATE, UDAT_HOUR_OF_DAY0_FIELD, 46, 48},
++            {UFIELD_CATEGORY_DATE, UDAT_MINUTE_FIELD, 49, 51}};
+         checkMixedFormattedValue(
+             message,
+             udtitvfmt_resultAsValue(fdi, &ec),
+@@ -438,23 +438,23 @@ static void TestFormatCalendarToResult() {
+ 
+     {
+         const char* message = "Field position test 1";
+-        const UChar* expectedString = u"27. September 2010, 15:00 – 2. März 2011, 18:30";
++        const UChar* expectedString = u"27. September 2010 um 15:00 – 2. März 2011 um 18:30";
+         udtitvfmt_formatCalendarToResult(fmt, ucal1, ucal2, fdi, &ec);
+         assertSuccess("Formatting", &ec);
+         static const UFieldPositionWithCategory expectedFieldPositions[] = {
+             // category, field, begin index, end index
+-            {UFIELD_CATEGORY_DATE_INTERVAL_SPAN, 0, 0, 25},
++            {UFIELD_CATEGORY_DATE_INTERVAL_SPAN, 0, 0, 27},
+             {UFIELD_CATEGORY_DATE, UDAT_DATE_FIELD, 0, 2},
+             {UFIELD_CATEGORY_DATE, UDAT_MONTH_FIELD, 4, 13},
+             {UFIELD_CATEGORY_DATE, UDAT_YEAR_FIELD, 14, 18},
+-            {UFIELD_CATEGORY_DATE, UDAT_HOUR_OF_DAY0_FIELD, 20, 22},
+-            {UFIELD_CATEGORY_DATE, UDAT_MINUTE_FIELD, 23, 25},
+-            {UFIELD_CATEGORY_DATE_INTERVAL_SPAN, 1, 28, 47},
+-            {UFIELD_CATEGORY_DATE, UDAT_DATE_FIELD, 28, 29},
+-            {UFIELD_CATEGORY_DATE, UDAT_MONTH_FIELD, 31, 35},
+-            {UFIELD_CATEGORY_DATE, UDAT_YEAR_FIELD, 36, 40},
+-            {UFIELD_CATEGORY_DATE, UDAT_HOUR_OF_DAY0_FIELD, 42, 44},
+-            {UFIELD_CATEGORY_DATE, UDAT_MINUTE_FIELD, 45, 47}};
++            {UFIELD_CATEGORY_DATE, UDAT_HOUR_OF_DAY0_FIELD, 22, 24},
++            {UFIELD_CATEGORY_DATE, UDAT_MINUTE_FIELD, 25, 27},
++            {UFIELD_CATEGORY_DATE_INTERVAL_SPAN, 1, 30, 51},
++            {UFIELD_CATEGORY_DATE, UDAT_DATE_FIELD, 30, 31},
++            {UFIELD_CATEGORY_DATE, UDAT_MONTH_FIELD, 33, 37},
++            {UFIELD_CATEGORY_DATE, UDAT_YEAR_FIELD, 38, 42},
++            {UFIELD_CATEGORY_DATE, UDAT_HOUR_OF_DAY0_FIELD, 46, 48},
++            {UFIELD_CATEGORY_DATE, UDAT_MINUTE_FIELD, 49, 51}};
+         checkMixedFormattedValue(
+             message,
+             udtitvfmt_resultAsValue(fdi, &ec),
+@@ -493,23 +493,23 @@ static void TestFormatCalendarToResult() {
+         ucal_setMillis(ucal5, Date158210160000, &ec);
+         //                                        1         2         3         4
+         //                              012345678901234567890123456789012345678901234567890
+-        const UChar* expectedString = u"4. Oktober 1582, 00:00 – 16. Oktober 1582, 00:00";
++        const UChar* expectedString = u"4. Oktober 1582 um 00:00 – 16. Oktober 1582 um 00:00";
+         udtitvfmt_formatCalendarToResult(fmt, ucal4, ucal5, fdi, &ec);
+         assertSuccess("Formatting", &ec);
+         static const UFieldPositionWithCategory expectedFieldPositions[] = {
+             // category, field, begin index, end index
+-            {UFIELD_CATEGORY_DATE_INTERVAL_SPAN, 0, 0, 22},
++            {UFIELD_CATEGORY_DATE_INTERVAL_SPAN, 0, 0, 24},
+             {UFIELD_CATEGORY_DATE, UDAT_DATE_FIELD, 0, 1},
+             {UFIELD_CATEGORY_DATE, UDAT_MONTH_FIELD, 3, 10},
+             {UFIELD_CATEGORY_DATE, UDAT_YEAR_FIELD, 11, 15},
+-            {UFIELD_CATEGORY_DATE, UDAT_HOUR_OF_DAY0_FIELD, 17, 19},
+-            {UFIELD_CATEGORY_DATE, UDAT_MINUTE_FIELD, 20, 22},
+-            {UFIELD_CATEGORY_DATE_INTERVAL_SPAN, 1, 25, 48},
+-            {UFIELD_CATEGORY_DATE, UDAT_DATE_FIELD, 25, 27},
+-            {UFIELD_CATEGORY_DATE, UDAT_MONTH_FIELD, 29, 36},
+-            {UFIELD_CATEGORY_DATE, UDAT_YEAR_FIELD, 37, 41},
+-            {UFIELD_CATEGORY_DATE, UDAT_HOUR_OF_DAY0_FIELD, 43, 45},
+-            {UFIELD_CATEGORY_DATE, UDAT_MINUTE_FIELD, 46, 48}};
++            {UFIELD_CATEGORY_DATE, UDAT_HOUR_OF_DAY0_FIELD, 19, 21},
++            {UFIELD_CATEGORY_DATE, UDAT_MINUTE_FIELD, 22, 24},
++            {UFIELD_CATEGORY_DATE_INTERVAL_SPAN, 1, 27, 52},
++            {UFIELD_CATEGORY_DATE, UDAT_DATE_FIELD, 27, 29},
++            {UFIELD_CATEGORY_DATE, UDAT_MONTH_FIELD, 31, 38},
++            {UFIELD_CATEGORY_DATE, UDAT_YEAR_FIELD, 39, 43},
++            {UFIELD_CATEGORY_DATE, UDAT_HOUR_OF_DAY0_FIELD, 47, 49},
++            {UFIELD_CATEGORY_DATE, UDAT_MINUTE_FIELD, 50, 52}};
+         checkMixedFormattedValue(
+             message,
+             udtitvfmt_resultAsValue(fdi, &ec),
+@@ -527,23 +527,23 @@ static void TestFormatCalendarToResult() {
+         const char* message = "Field position test 4";
+         //                                        1         2         3         4
+         //                              012345678901234567890123456789012345678901234567890
+-        const UChar* expectedString = u"14. Oktober 1582, 00:00 – 16. Oktober 1582, 00:00";
++        const UChar* expectedString = u"14. Oktober 1582 um 00:00 – 16. Oktober 1582 um 00:00";
+         udtitvfmt_formatCalendarToResult(fmt, ucal4, ucal5, fdi, &ec);
+         assertSuccess("Formatting", &ec);
+         static const UFieldPositionWithCategory expectedFieldPositions[] = {
+             // category, field, begin index, end index
+-            {UFIELD_CATEGORY_DATE_INTERVAL_SPAN, 0, 0, 23},
++            {UFIELD_CATEGORY_DATE_INTERVAL_SPAN, 0, 0, 25},
+             {UFIELD_CATEGORY_DATE, UDAT_DATE_FIELD, 0, 2},
+             {UFIELD_CATEGORY_DATE, UDAT_MONTH_FIELD, 4, 11},
+             {UFIELD_CATEGORY_DATE, UDAT_YEAR_FIELD, 12, 16},
+-            {UFIELD_CATEGORY_DATE, UDAT_HOUR_OF_DAY0_FIELD, 18, 20},
+-            {UFIELD_CATEGORY_DATE, UDAT_MINUTE_FIELD, 21, 23},
+-            {UFIELD_CATEGORY_DATE_INTERVAL_SPAN, 1, 26, 49},
+-            {UFIELD_CATEGORY_DATE, UDAT_DATE_FIELD, 26, 28},
+-            {UFIELD_CATEGORY_DATE, UDAT_MONTH_FIELD, 30, 37},
+-            {UFIELD_CATEGORY_DATE, UDAT_YEAR_FIELD, 38, 42},
+-            {UFIELD_CATEGORY_DATE, UDAT_HOUR_OF_DAY0_FIELD, 44, 46},
+-            {UFIELD_CATEGORY_DATE, UDAT_MINUTE_FIELD, 47, 49}};
++            {UFIELD_CATEGORY_DATE, UDAT_HOUR_OF_DAY0_FIELD, 20, 22},
++            {UFIELD_CATEGORY_DATE, UDAT_MINUTE_FIELD, 23, 25},
++            {UFIELD_CATEGORY_DATE_INTERVAL_SPAN, 1, 28, 53},
++            {UFIELD_CATEGORY_DATE, UDAT_DATE_FIELD, 28, 30},
++            {UFIELD_CATEGORY_DATE, UDAT_MONTH_FIELD, 32, 39},
++            {UFIELD_CATEGORY_DATE, UDAT_YEAR_FIELD, 40, 44},
++            {UFIELD_CATEGORY_DATE, UDAT_HOUR_OF_DAY0_FIELD, 48, 50},
++            {UFIELD_CATEGORY_DATE, UDAT_MINUTE_FIELD, 51, 53}};
+         checkMixedFormattedValue(
+             message,
+             udtitvfmt_resultAsValue(fdi, &ec),
+diff --git a/icu4c/source/test/cintltst/udatpg_test.c b/icu4c/source/test/cintltst/udatpg_test.c
+index 5f15577b26..66cfb41d47 100644
+--- a/icu4c/source/test/cintltst/udatpg_test.c
++++ b/icu4c/source/test/cintltst/udatpg_test.c
+@@ -46,6 +46,7 @@ static void TestGetFieldDisplayNames(void);
+ static void TestGetDefaultHourCycle(void);
+ static void TestGetDefaultHourCycleOnEmptyInstance(void);
+ static void TestEras(void);
++static void TestDateTimePatterns(void);
+ 
+ void addDateTimePatternGeneratorTest(TestNode** root) {
+     TESTCASE(TestOpenClose);
+@@ -56,6 +57,7 @@ void addDateTimePatternGeneratorTest(TestNode** root) {
+     TESTCASE(TestGetDefaultHourCycle);
+     TESTCASE(TestGetDefaultHourCycleOnEmptyInstance);
+     TESTCASE(TestEras);
++    TESTCASE(TestDateTimePatterns);
+ }
+ 
+ /*
+@@ -614,4 +616,178 @@ static void TestEras(void) {
+     }
+ }
+ 
++enum { kNumDateTimePatterns = 4 };
++
++typedef struct {
++    const char* localeID;
++    const UChar* expectPat[kNumDateTimePatterns];
++} DTPLocaleAndResults;
++
++static void doDTPatternTest(UDateTimePatternGenerator* udtpg,
++                            const UChar** skeletons,
++                            DTPLocaleAndResults* localeAndResultsPtr);
++
++static void TestDateTimePatterns(void) {
++    const UChar* skeletons[kNumDateTimePatterns] = {
++        u"yMMMMEEEEdjmm", // full date, short time
++        u"yMMMMdjmm",     // long date, short time
++        u"yMMMdjmm",      // medium date, short time
++        u"yMdjmm"         // short date, short time
++    };
++    // The following tests some locales in which there are differences between the
++    // DateTimePatterns of various length styles.
++    DTPLocaleAndResults localeAndResults[] = {
++        { "en", { u"EEEE, MMMM d, y 'at' h:mm a", // long != medium
++                  u"MMMM d, y 'at' h:mm a",
++                  u"MMM d, y, h:mm a",
++                  u"M/d/y, h:mm a" } },
++        { "fr", { u"EEEE d MMMM y 'à' HH:mm", // medium != short
++                  u"d MMMM y 'à' HH:mm",
++                  u"d MMM y, HH:mm",
++                  u"dd/MM/y HH:mm" } },
++        { "ha", { u"EEEE d MMMM, y HH:mm", // full != long
++                  u"d MMMM, y 'da' HH:mm",
++                  u"d MMM, y, HH:mm",
++                  u"y-MM-dd, HH:mm" } },
++        { NULL, { NULL, NULL, NULL, NULL } } // terminator
++    };
++
++    const UChar* enDTPatterns[kNumDateTimePatterns] = {
++        u"{1} 'at' {0}",
++        u"{1} 'at' {0}",
++        u"{1}, {0}",
++        u"{1}, {0}"
++    };
++    const UChar* modDTPatterns[kNumDateTimePatterns] = {
++        u"{1} _0_ {0}",
++        u"{1} _1_ {0}",
++        u"{1} _2_ {0}",
++        u"{1} _3_ {0}"
++    };
++    DTPLocaleAndResults enModResults = { "en", { u"EEEE, MMMM d, y _0_ h:mm a",
++                                                 u"MMMM d, y _1_ h:mm a",
++                                                 u"MMM d, y _2_ h:mm a",
++                                                 u"M/d/y _3_ h:mm a" }
++    };
++
++    // Test various locales with standard data
++    UErrorCode status;
++    UDateTimePatternGenerator* udtpg;
++    DTPLocaleAndResults* localeAndResultsPtr = localeAndResults;
++    for (; localeAndResultsPtr->localeID != NULL; localeAndResultsPtr++) {
++        status = U_ZERO_ERROR;
++        udtpg = udatpg_open(localeAndResultsPtr->localeID, &status);
++        if (U_FAILURE(status)) {
++            log_data_err("FAIL: udatpg_open for locale %s: %s", localeAndResultsPtr->localeID, myErrorName(status));
++        } else {
++            doDTPatternTest(udtpg, skeletons, localeAndResultsPtr);
++            udatpg_close(udtpg);
++        }
++    }
++    // Test getting and modifying date-time combining patterns
++    status = U_ZERO_ERROR;
++    udtpg = udatpg_open("en", &status);
++    if (U_FAILURE(status)) {
++        log_data_err("FAIL: udatpg_open #2 for locale en: %s", myErrorName(status));
++    } else {
++        char bExpect[64];
++        char bGet[64];
++        const UChar* uGet;
++        int32_t uGetLen, uExpectLen;
++
++        // Test error: style out of range
++        status = U_ZERO_ERROR;
++        uGet = udatpg_getDateTimeFormatForStyle(udtpg, UDAT_NONE, &uGetLen, &status);
++        if (status != U_ILLEGAL_ARGUMENT_ERROR || uGetLen != 0 || uGet==NULL || *uGet!= 0) {
++            if (uGet==NULL) {
++                log_err("FAIL: udatpg_getDateTimeFormatForStyle with invalid style, expected U_ILLEGAL_ARGUMENT_ERROR "
++                        "and ptr to empty string but got %s, len %d, ptr = NULL\n", myErrorName(status), uGetLen);
++            } else {
++                log_err("FAIL: udatpg_getDateTimeFormatForStyle with invalid style, expected U_ILLEGAL_ARGUMENT_ERROR "
++                        "and ptr to empty string but got %s, len %d, *ptr = %04X\n", myErrorName(status), uGetLen, *uGet);
++            }
++        }
++
++        // Test normal getting and setting
++        for (int32_t patStyle = 0; patStyle < kNumDateTimePatterns; patStyle++) {
++            status = U_ZERO_ERROR;
++            uExpectLen = u_strlen(enDTPatterns[patStyle]);
++            uGet = udatpg_getDateTimeFormatForStyle(udtpg, patStyle, &uGetLen, &status);
++            if (U_FAILURE(status)) {
++                log_err("FAIL udatpg_getDateTimeFormatForStyle %d (en before mod), get %s\n", patStyle, myErrorName(status));
++            } else if (uGetLen != uExpectLen || u_strncmp(uGet, enDTPatterns[patStyle], uExpectLen) != 0) {
++                u_austrcpy(bExpect, enDTPatterns[patStyle]);
++                u_austrcpy(bGet, uGet);
++                log_err("ERROR udatpg_getDateTimeFormatForStyle %d (en before mod), expect %d:\"%s\", get %d:\"%s\"\n",
++                        patStyle, uExpectLen, bExpect, uGetLen, bGet);
++            }
++            status = U_ZERO_ERROR;
++            udatpg_setDateTimeFormatForStyle(udtpg, patStyle, modDTPatterns[patStyle], -1, &status);
++            if (U_FAILURE(status)) {
++                log_err("FAIL udatpg_setDateTimeFormatForStyle %d (en), get %s\n", patStyle, myErrorName(status));
++            } else {
++                uExpectLen = u_strlen(modDTPatterns[patStyle]);
++                uGet = udatpg_getDateTimeFormatForStyle(udtpg, patStyle, &uGetLen, &status);
++                if (U_FAILURE(status)) {
++                    log_err("FAIL udatpg_getDateTimeFormatForStyle %d (en after  mod), get %s\n", patStyle, myErrorName(status));
++                } else if (uGetLen != uExpectLen || u_strncmp(uGet, modDTPatterns[patStyle], uExpectLen) != 0) {
++                    u_austrcpy(bExpect, modDTPatterns[patStyle]);
++                    u_austrcpy(bGet, uGet);
++                    log_err("ERROR udatpg_getDateTimeFormatForStyle %d (en after  mod), expect %d:\"%s\", get %d:\"%s\"\n",
++                            patStyle, uExpectLen, bExpect, uGetLen, bGet);
++                }
++            }
++        }
++        // Test result of setting
++        doDTPatternTest(udtpg, skeletons, &enModResults);
++        // Test old get/set functions
++        uExpectLen = u_strlen(modDTPatterns[UDAT_MEDIUM]);
++        uGet = udatpg_getDateTimeFormat(udtpg, &uGetLen);
++        if (uGetLen != uExpectLen || u_strncmp(uGet, modDTPatterns[UDAT_MEDIUM], uExpectLen) != 0) {
++            u_austrcpy(bExpect, modDTPatterns[UDAT_MEDIUM]);
++            u_austrcpy(bGet, uGet);
++            log_err("ERROR udatpg_getDateTimeFormat (en after  mod), expect %d:\"%s\", get %d:\"%s\"\n",
++                    uExpectLen, bExpect, uGetLen, bGet);
++        }
++        udatpg_setDateTimeFormat(udtpg, modDTPatterns[UDAT_SHORT], -1); // set all dateTimePatterns to the short format
++        uExpectLen = u_strlen(modDTPatterns[UDAT_SHORT]);
++        u_austrcpy(bExpect, modDTPatterns[UDAT_SHORT]);
++        for (int32_t patStyle = 0; patStyle < kNumDateTimePatterns; patStyle++) {
++            status = U_ZERO_ERROR;
++            uGet = udatpg_getDateTimeFormatForStyle(udtpg, patStyle, &uGetLen, &status);
++            if (U_FAILURE(status)) {
++                log_err("FAIL udatpg_getDateTimeFormatForStyle %d (en after second mod), get %s\n", patStyle, myErrorName(status));
++            } else if (uGetLen != uExpectLen || u_strncmp(uGet, modDTPatterns[UDAT_SHORT], uExpectLen) != 0) {
++                u_austrcpy(bGet, uGet);
++                log_err("ERROR udatpg_getDateTimeFormatForStyle %d (en after second mod), expect %d:\"%s\", get %d:\"%s\"\n",
++                        patStyle, uExpectLen, bExpect, uGetLen, bGet);
++            }
++        }
++
++        udatpg_close(udtpg);
++    }
++}
++
++static void doDTPatternTest(UDateTimePatternGenerator* udtpg,
++                            const UChar** skeletons,
++                            DTPLocaleAndResults* localeAndResultsPtr) {
++    for (int32_t patStyle = 0; patStyle < kNumDateTimePatterns; patStyle++) {
++        UChar uGet[64];
++        int32_t uGetLen, uExpectLen;
++        UErrorCode status = U_ZERO_ERROR;
++        uExpectLen = u_strlen(localeAndResultsPtr->expectPat[patStyle]);
++        uGetLen = udatpg_getBestPattern(udtpg, skeletons[patStyle], -1, uGet, 64, &status);
++        if (U_FAILURE(status)) {
++            log_err("FAIL udatpg_getBestPattern locale %s style %d: %s\n", localeAndResultsPtr->localeID, patStyle, myErrorName(status));
++        } else if (uGetLen != uExpectLen || u_strncmp(uGet, localeAndResultsPtr->expectPat[patStyle], uExpectLen) != 0) {
++            char bExpect[64];
++            char bGet[64];
++            u_austrcpy(bExpect, localeAndResultsPtr->expectPat[patStyle]);
++            u_austrcpy(bGet, uGet);
++            log_err("ERROR udatpg_getBestPattern locale %s style %d, expect %d:\"%s\", get %d:\"%s\"\n",
++                    localeAndResultsPtr->localeID, patStyle, uExpectLen, bExpect, uGetLen, bGet);
++        }
++    }
++}
++
+ #endif
+diff --git a/icu4c/source/test/intltest/dtfmttst.cpp b/icu4c/source/test/intltest/dtfmttst.cpp
+index 16f3002a95..920ec75c8b 100644
+--- a/icu4c/source/test/intltest/dtfmttst.cpp
++++ b/icu4c/source/test/intltest/dtfmttst.cpp
+@@ -190,7 +190,7 @@ void DateFormatTest::TestPatterns() {
+         {UDAT_ABBR_UTC_TZ, "ZZZZ", "en", "ZZZZ"},
+ 
+         {UDAT_YEAR_NUM_MONTH_DAY UDAT_ABBR_UTC_TZ, "yMdZZZZ", "en", "M/d/y, ZZZZ"},
+-        {UDAT_MONTH_DAY UDAT_LOCATION_TZ, "MMMMdVVVV", "en", "MMMM d, VVVV"}
++        {UDAT_MONTH_DAY UDAT_LOCATION_TZ, "MMMMdVVVV", "en", "MMMM d 'at' VVVV"}
+     };
+ 
+     IcuTestErrorCode errorCode(*this, "TestPatterns()");
+diff --git a/icu4c/source/test/intltest/dtptngts.cpp b/icu4c/source/test/intltest/dtptngts.cpp
+index 6fe8af05b6..dde9d4dd3a 100644
+--- a/icu4c/source/test/intltest/dtptngts.cpp
++++ b/icu4c/source/test/intltest/dtptngts.cpp
+@@ -46,6 +46,7 @@ void IntlTestDateTimePatternGeneratorAPI::runIndexedTest( int32_t index, UBool e
+         TESTCASE(10, testGetDefaultHourCycle_OnEmptyInstance);
+         TESTCASE(11, test_jConsistencyOddLocales);
+         TESTCASE(12, testBestPattern);
++        TESTCASE(13, testDateTimePatterns);
+         default: name = ""; break;
+     }
+ }
+@@ -530,7 +531,7 @@ void IntlTestDateTimePatternGeneratorAPI::testAPI(/*char *par*/)
+     format->applyPattern(gen->getBestPattern(UnicodeString("MMMMdHmm"), status));
+     dateReturned.remove();
+     dateReturned = format->format(sampleDate, dateReturned, status);
+-    expectedResult=UnicodeString("14. von Oktober, 08:58", -1, US_INV);
++    expectedResult=UnicodeString("14. von Oktober um 08:58", -1, US_INV);
+     if ( dateReturned != expectedResult ) {
+         errln(UnicodeString("ERROR: Simple test addPattern failed!: d\'. von\' MMMM   Got: ") + dateReturned + UnicodeString(" Expected: ") + expectedResult);
+     }
+@@ -1631,4 +1632,150 @@ void IntlTestDateTimePatternGeneratorAPI::testBestPattern() {
+     }
+ }
+ 
++void IntlTestDateTimePatternGeneratorAPI::testDateTimePatterns() {
++    UnicodeString skeletons[kNumDateTimePatterns] = {
++        UnicodeString("yMMMMEEEEdjmm"), // full date, short time
++        UnicodeString("yMMMMdjmm"),     // long date, short time
++        UnicodeString("yMMMdjmm"),      // medium date, short time
++        UnicodeString("yMdjmm")         // short date, short time
++    };
++    // The following tests some locales in which there are differences between the
++    // DateTimePatterns of various length styles.
++    DTPLocaleAndResults localeAndResults[] = {
++        { "en", { UnicodeString(u"EEEE, MMMM d, y 'at' h:mm a"), // long != medium
++                  UnicodeString(u"MMMM d, y 'at' h:mm a"),
++                  UnicodeString(u"MMM d, y, h:mm a"),
++                  UnicodeString(u"M/d/y, h:mm a") } },
++        { "fr", { UnicodeString(u"EEEE d MMMM y 'à' HH:mm"), // medium != short
++                  UnicodeString(u"d MMMM y 'à' HH:mm"),
++                  UnicodeString(u"d MMM y, HH:mm"),
++                  UnicodeString(u"dd/MM/y HH:mm") } },
++        { "ha", { UnicodeString(u"EEEE d MMMM, y HH:mm"), // full != long
++                  UnicodeString(u"d MMMM, y 'da' HH:mm"),
++                  UnicodeString(u"d MMM, y, HH:mm"),
++                  UnicodeString(u"y-MM-dd, HH:mm") } },
++        { nullptr, { UnicodeString(""), UnicodeString(""), // terminator
++                    UnicodeString(""), UnicodeString("") } },
++    };
++
++    UnicodeString enDTPatterns[kNumDateTimePatterns] = {
++        UnicodeString(u"{1} 'at' {0}"),
++        UnicodeString(u"{1} 'at' {0}"),
++        UnicodeString(u"{1}, {0}"),
++        UnicodeString(u"{1}, {0}")
++    };
++    UnicodeString modDTPatterns[kNumDateTimePatterns] = {
++        UnicodeString(u"{1} _0_ {0}"),
++        UnicodeString(u"{1} _1_ {0}"),
++        UnicodeString(u"{1} _2_ {0}"),
++        UnicodeString(u"{1} _3_ {0}")
++    };
++    DTPLocaleAndResults enModResults = { "en", { UnicodeString(u"EEEE, MMMM d, y _0_ h:mm a"),
++                                                 UnicodeString(u"MMMM d, y _1_ h:mm a"),
++                                                 UnicodeString(u"MMM d, y _2_ h:mm a"),
++                                                 UnicodeString(u"M/d/y _3_ h:mm a") }
++    };
++
++    // Test various locales with standard data
++    UErrorCode status;
++    LocalPointer<DateTimePatternGenerator> dtpg;
++    DTPLocaleAndResults* localeAndResultsPtr = localeAndResults;
++    for (; localeAndResultsPtr->localeID != nullptr; localeAndResultsPtr++) {
++        status = U_ZERO_ERROR;
++        Locale locale(localeAndResultsPtr->localeID);
++        dtpg.adoptInstead(DateTimePatternGenerator::createInstance(locale, status));
++        if (U_FAILURE(status)) {
++            dataerrln("FAIL: DateTimePatternGenerator::createInstance for locale %s: %s",
++                        localeAndResultsPtr->localeID, u_errorName(status));
++        } else {
++            doDTPatternTest(dtpg.getAlias(), skeletons, localeAndResultsPtr);
++        }
++    }
++    // Test getting and modifying date-time combining patterns
++    status = U_ZERO_ERROR;
++    dtpg.adoptInstead(DateTimePatternGenerator::createInstance(Locale::getEnglish(), status));
++    if (U_FAILURE(status)) {
++        dataerrln("FAIL: DateTimePatternGenerator::createInstance #2 for locale en: %s", u_errorName(status));
++    } else {
++        char bExpect[64];
++        char bGet[64];
++        // Test style out of range
++        status = U_ZERO_ERROR;
++        const UnicodeString& dtFormat0 = dtpg->getDateTimeFormat(UDAT_NONE, status);
++        int32_t dtFormat0Len = dtFormat0.length();
++        if (status != U_ILLEGAL_ARGUMENT_ERROR || dtFormat0Len != 0) {
++            errln("ERROR: getDateTimeFormat with invalid style, expected U_ILLEGAL_ARGUMENT_ERROR and lero-length string, "
++                  "got %s with length %d", u_errorName(status), dtFormat0Len);
++        }
++        // Test normal getting and setting
++        for (int32_t patStyle = 0; patStyle < kNumDateTimePatterns; patStyle++) {
++            status = U_ZERO_ERROR;
++            const UnicodeString& dtFormat1 = dtpg->getDateTimeFormat((UDateFormatStyle)patStyle, status);
++            if (U_FAILURE(status)) {
++                errln("FAIL: getDateTimeFormat for en before mod, style %d, get %s", patStyle, u_errorName(status));
++            } else  if (dtFormat1 != enDTPatterns[patStyle]) {
++                enDTPatterns[patStyle].extract(0, enDTPatterns[patStyle].length(), bExpect, 64);
++                dtFormat1.extract(0, dtFormat1.length(), bGet, 64);
++                errln("ERROR: getDateTimeFormat for en before mod, style %d, expect \"%s\", get \"%s\"",
++                        patStyle, bExpect, bGet);
++            }
++            status = U_ZERO_ERROR;
++            dtpg->setDateTimeFormat((UDateFormatStyle)patStyle, modDTPatterns[patStyle], status);
++            if (U_FAILURE(status)) {
++                errln("FAIL: setDateTimeFormat for en, style %d, get %s", patStyle, u_errorName(status));
++            } else {
++                const UnicodeString& dtFormat2 = dtpg->getDateTimeFormat((UDateFormatStyle)patStyle, status);
++                if (U_FAILURE(status)) {
++                    errln("FAIL: getDateTimeFormat for en after  mod, style %d, get %s", patStyle, u_errorName(status));
++                } else if (dtFormat2 != modDTPatterns[patStyle]) {
++                    modDTPatterns[patStyle].extract(0, modDTPatterns[patStyle].length(), bExpect, 64);
++                    dtFormat2.extract(0, dtFormat2.length(), bGet, 64);
++                    errln("ERROR: getDateTimeFormat for en after mod, style %d, expect \"%s\", get \"%s\"",
++                            patStyle, bExpect, bGet);
++                }
++            }
++        }
++        // Test result of setting
++        doDTPatternTest(dtpg.getAlias(), skeletons, &enModResults);
++        // Test old get/set functions
++        const UnicodeString& dtFormat3 = dtpg->getDateTimeFormat();
++        if (dtFormat3 != modDTPatterns[UDAT_MEDIUM]) {
++            modDTPatterns[UDAT_MEDIUM].extract(0, modDTPatterns[UDAT_MEDIUM].length(), bExpect, 64);
++            dtFormat3.extract(0, dtFormat3.length(), bGet, 64);
++            errln("ERROR: old getDateTimeFormat for en after mod, expect \"%s\", get \"%s\"", bExpect, bGet);
++        }
++        dtpg->setDateTimeFormat(modDTPatterns[UDAT_SHORT]); // set all dateTimePatterns to the short format
++        modDTPatterns[UDAT_SHORT].extract(0, modDTPatterns[UDAT_SHORT].length(), bExpect, 64);
++        for (int32_t patStyle = 0; patStyle < kNumDateTimePatterns; patStyle++) {
++            status = U_ZERO_ERROR;
++            const UnicodeString& dtFormat4 = dtpg->getDateTimeFormat((UDateFormatStyle)patStyle, status);
++            if (U_FAILURE(status)) {
++                errln("FAIL: getDateTimeFormat for en after second mod, style %d, get %s", patStyle, u_errorName(status));
++            } else if (dtFormat4 != modDTPatterns[UDAT_SHORT]) {
++                dtFormat4.extract(0, dtFormat4.length(), bGet, 64);
++                errln("ERROR: getDateTimeFormat for en after second mod, style %d, expect \"%s\", get \"%s\"",
++                        patStyle, bExpect, bGet);
++            }
++        }
++    }
++}
++
++void IntlTestDateTimePatternGeneratorAPI::doDTPatternTest(DateTimePatternGenerator* dtpg, UnicodeString* skeletons, DTPLocaleAndResults* localeAndResultsPtr) {
++    for (int32_t patStyle = 0; patStyle < kNumDateTimePatterns; patStyle++) {
++        UErrorCode status = U_ZERO_ERROR;
++        UnicodeString getPat = dtpg->getBestPattern(skeletons[patStyle], UDATPG_MATCH_NO_OPTIONS, status);
++        if (U_FAILURE(status)) {
++            errln("FAIL: DateTimePatternGenerator::getBestPattern locale %s, style %d: %s",
++                        localeAndResultsPtr->localeID, patStyle, u_errorName(status));
++        } else if (getPat != localeAndResultsPtr->expectPat[patStyle]) {
++            char bExpect[64];
++            char bGet[64];
++            localeAndResultsPtr->expectPat[patStyle].extract(0, localeAndResultsPtr->expectPat[patStyle].length(), bExpect, 64);
++            getPat.extract(0, getPat.length(), bGet, 64);
++            errln("ERROR: DateTimePatternGenerator::getBestPattern locale %s, style %d, expect \"%s\", get \"%s\"",
++                        localeAndResultsPtr->localeID, patStyle, bExpect, bGet);
++        }
++    }
++}
++
+ #endif /* #if !UCONFIG_NO_FORMATTING */
+diff --git a/icu4c/source/test/intltest/dtptngts.h b/icu4c/source/test/intltest/dtptngts.h
+index 4650fd7fcf..ec700603eb 100644
+--- a/icu4c/source/test/intltest/dtptngts.h
++++ b/icu4c/source/test/intltest/dtptngts.h
+@@ -13,6 +13,8 @@
+ 
+ #if !UCONFIG_NO_FORMATTING
+ 
++#include "unicode/dtptngen.h"
++#include "unicode/ustring.h"
+ #include "intltest.h"
+ 
+ /**
+@@ -38,6 +40,14 @@ class IntlTestDateTimePatternGeneratorAPI : public IntlTest {
+     void testGetDefaultHourCycle_OnEmptyInstance();
+     void test_jConsistencyOddLocales();
+     void testBestPattern();
++    void testDateTimePatterns();
++
++    enum { kNumDateTimePatterns = 4 };
++    typedef struct {
++        const char* localeID;
++        const UnicodeString expectPat[kNumDateTimePatterns];
++    } DTPLocaleAndResults;
++    void doDTPatternTest(DateTimePatternGenerator* dtpg, UnicodeString* skeletons, DTPLocaleAndResults* localeAndResultsPtr);
+ };
+ 
+ #endif /* #if !UCONFIG_NO_FORMATTING */
+diff --git a/icu4c/source/test/intltest/tmsgfmt.cpp b/icu4c/source/test/intltest/tmsgfmt.cpp
+index e55aa8fbe3..66f4982221 100644
+--- a/icu4c/source/test/intltest/tmsgfmt.cpp
++++ b/icu4c/source/test/intltest/tmsgfmt.cpp
+@@ -2051,7 +2051,7 @@ void TestMessageFormat::TestMessageFormatDateSkeleton() {
+     UDate date = LocaleTest::date(2021-1900, UCAL_NOVEMBER, 23, 16, 42, 55);
+ 
+     doTheRealDateTimeSkeletonTesting(date, u"{0,date,::MMMMd}", "en", u"November 23", status);
+-    doTheRealDateTimeSkeletonTesting(date, u"{0,date,::yMMMMdjm}", "en", u"November 23, 2021, 4:42 PM", status);
++    doTheRealDateTimeSkeletonTesting(date, u"{0,date,::yMMMMdjm}", "en", u"November 23, 2021 at 4:42 PM", status);
+     doTheRealDateTimeSkeletonTesting(date, u"{0,date,   ::   yMMMMd   }", "en", u"November 23, 2021", status);
+     doTheRealDateTimeSkeletonTesting(date, u"{0,date,::yMMMMd}", "fr", u"23 novembre 2021", status);
+     doTheRealDateTimeSkeletonTesting(date, u"Expiration: {0,date,::yMMM}!", "en", u"Expiration: Nov 2021!", status);
+@@ -2065,7 +2065,7 @@ void TestMessageFormat::TestMessageFormatTimeSkeleton() {
+     UDate date = LocaleTest::date(2021-1900, UCAL_NOVEMBER, 23, 16, 42, 55);
+ 
+     doTheRealDateTimeSkeletonTesting(date, u"{0,time,::MMMMd}", "en", u"November 23", status);
+-    doTheRealDateTimeSkeletonTesting(date, u"{0,time,::yMMMMdjm}", "en", u"November 23, 2021, 4:42 PM", status);
++    doTheRealDateTimeSkeletonTesting(date, u"{0,time,::yMMMMdjm}", "en", u"November 23, 2021 at 4:42 PM", status);
+     doTheRealDateTimeSkeletonTesting(date, u"{0,time,   ::   yMMMMd   }", "en", u"November 23, 2021", status);
+     doTheRealDateTimeSkeletonTesting(date, u"{0,time,::yMMMMd}", "fr", u"23 novembre 2021", status);
+     doTheRealDateTimeSkeletonTesting(date, u"Expiration: {0,time,::yMMM}!", "en", u"Expiration: Nov 2021!", status);
+-- 
+2.35.1
+

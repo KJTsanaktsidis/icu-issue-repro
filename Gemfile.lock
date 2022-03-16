@@ -1,0 +1,21 @@
+GIT
+  remote: https://github.com/KJTsanaktsidis/ffi-icu.git
+  revision: 8a3058f5911ba2798c8730806c065fec25f88c55
+  ref: 8a3058f5911ba2798c8730806c065fec25f88c55
+  specs:
+    ffi-icu (0.4.0)
+      ffi (~> 1.0, >= 1.0.9)
+
+GEM
+  remote: https://rubygems.org/
+  specs:
+    ffi (1.15.5)
+
+PLATFORMS
+  arm64-darwin-21
+
+DEPENDENCIES
+  ffi-icu!
+
+BUNDLED WITH
+   2.2.30
